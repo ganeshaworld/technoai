@@ -1,9 +1,85 @@
 import os
 import json
+import time
+import asyncio
+import logging
 import httpx
 from abc import ABC, abstractmethod
 from typing import AsyncGenerator, Dict, Any, List, Optional
 from backend.app.config import settings
+
+logger = logging.getLogger("technopie.ai.provider")
+
+# ==============================================================================
+# Structured AI Provider Exceptions
+# ==============================================================================
+
+class AIProviderError(Exception):
+    """Base exception for all AI Provider errors."""
+    def __init__(
+        self,
+        message: str,
+        provider: str = "unknown",
+        status_code: int = 500,
+        retryable: bool = False
+    ):
+        super().__init__(message)
+        self.message = message
+        self.provider = provider
+        self.status_code = status_code
+        self.retryable = retryable
+
+    def __str__(self) -> str:
+        return f"[{self.provider.upper()}] {self.message} (HTTP {self.status_code})"
+
+
+class AIProviderMissingKeyError(AIProviderError):
+    """Raised when an API key is required but missing from environment."""
+    def __init__(self, provider: str = "gemini", message: Optional[str] = None):
+        env_var_name = "GOOGLE_API_KEY" if provider.lower() == "gemini" else f"{provider.upper()}_API_KEY"
+        msg = (
+            message or
+            f"AI Provider Configuration Error: {env_var_name} is not configured "
+            f"in environment variables. Please set {env_var_name} to enable real "
+            f"{provider.capitalize()} assistant capabilities."
+        )
+        super().__init__(message=msg, provider=provider, status_code=503, retryable=False)
+
+
+class AIProviderTimeoutError(AIProviderError):
+    """Raised when an AI Provider API call times out after all retries."""
+    def __init__(self, provider: str = "gemini", timeout_seconds: float = 30.0):
+        super().__init__(
+            message=f"AI Provider Timeout: {provider.capitalize()} API did not respond within {timeout_seconds}s limit after all retry attempts.",
+            provider=provider,
+            status_code=504,
+            retryable=True
+        )
+
+
+class AIProviderRateLimitError(AIProviderError):
+    """Raised on HTTP 429 quota/rate limit error."""
+    def __init__(self, provider: str = "gemini", detail: str = ""):
+        msg = f"AI Provider Rate Limit / Quota Exceeded: {provider.capitalize()} request limit reached."
+        if detail:
+            msg += f" Details: {detail}"
+        super().__init__(message=msg, provider=provider, status_code=429, retryable=True)
+
+
+class AIProviderAPIError(AIProviderError):
+    """Raised on upstream HTTP 4xx/5xx API errors."""
+    def __init__(self, provider: str, status_code: int, detail: str = ""):
+        super().__init__(
+            message=f"AI Provider API Error ({provider.capitalize()} status {status_code}): {detail}",
+            provider=provider,
+            status_code=status_code,
+            retryable=(status_code in (500, 502, 503, 504))
+        )
+
+
+# ==============================================================================
+# Base LLM Provider Interface
+# ==============================================================================
 
 class BaseLLMProvider(ABC):
     @abstractmethod
@@ -29,10 +105,229 @@ class BaseLLMProvider(ABC):
         """Stream response tokens."""
         pass
 
+
+# ==============================================================================
+# Google Gemini Provider (Primary Active Model in Phase 2A)
+# ==============================================================================
+
+class GeminiProvider(BaseLLMProvider):
+    """
+    Production Google Gemini Provider using Google Generative Language v1beta API.
+    Features:
+    - Environment variable authentication
+    - Configurable timeout and exponential backoff retry loop
+    - Token usage tracking and structured logging
+    - Explicit non-silent error propagation
+    """
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key or settings.GOOGLE_API_KEY
+        self.base_url = "https://generativelanguage.googleapis.com/v1beta"
+        self.provider_name = "gemini"
+
+    async def generate_response(
+        self,
+        messages: List[Dict[str, str]],
+        system_prompt: str,
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        tools: Optional[List[Dict[str, Any]]] = None
+    ) -> Dict[str, Any]:
+        if not self.api_key or not self.api_key.strip():
+            raise AIProviderMissingKeyError(self.provider_name)
+
+        gemini_model = model or settings.DEFAULT_FAST_MODEL
+        contents = []
+        for m in messages:
+            role = "user" if m.get("role") == "user" else "model"
+            contents.append({"role": role, "parts": [{"text": m.get("content", "")}]})
+
+        payload: Dict[str, Any] = {
+            "contents": contents,
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "generationConfig": {"temperature": temperature}
+        }
+        if tools:
+            payload["tools"] = tools
+
+        url = f"{self.base_url}/models/{gemini_model}:generateContent?key={self.api_key}"
+        timeout = settings.AI_REQUEST_TIMEOUT_SECONDS
+        max_retries = settings.AI_MAX_RETRIES
+        backoff_factor = settings.AI_RETRY_BACKOFF_FACTOR
+
+        for attempt in range(1, max_retries + 1):
+            start_time = time.time()
+            try:
+                logger.info(
+                    "Gemini API request: model=%s, attempt=%d/%d, timeout=%.1fs",
+                    gemini_model, attempt, max_retries, timeout
+                )
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    resp = await client.post(url, json=payload)
+                    elapsed = time.time() - start_time
+
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        candidates = data.get("candidates", [])
+                        text = ""
+                        tool_calls = []
+                        if candidates:
+                            cand = candidates[0]
+                            content = cand.get("content", {})
+                            parts = content.get("parts", [])
+                            for part in parts:
+                                if "text" in part:
+                                    text += part["text"]
+                                elif "functionCall" in part:
+                                    tool_calls.append(part["functionCall"])
+
+                        usage = data.get("usageMetadata", {})
+                        total_tokens = usage.get("totalTokenCount", 0)
+                        prompt_tokens = usage.get("promptTokenCount", 0)
+                        cand_tokens = usage.get("candidatesTokenCount", 0)
+
+                        logger.info(
+                            "Gemini API success in %.2fs: total_tokens=%d (prompt=%d, completion=%d)",
+                            elapsed, total_tokens, prompt_tokens, cand_tokens
+                        )
+                        return {
+                            "content": text,
+                            "provider": self.provider_name,
+                            "model": gemini_model,
+                            "tokens_used": total_tokens,
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": cand_tokens,
+                            "tool_calls": tool_calls
+                        }
+
+                    # Non-200 responses
+                    status_code = resp.status_code
+                    error_text = resp.text
+                    try:
+                        err_json = resp.json().get("error", {})
+                        detail = err_json.get("message", error_text)
+                    except Exception:
+                        detail = error_text
+
+                    if status_code == 429:
+                        if attempt < max_retries:
+                            wait_time = backoff_factor ** attempt
+                            logger.warning(
+                                "Gemini quota/rate limit (429). Retrying in %.2fs (attempt %d/%d)...",
+                                wait_time, attempt, max_retries
+                            )
+                            await asyncio.sleep(wait_time)
+                            continue
+                        raise AIProviderRateLimitError(self.provider_name, detail)
+
+                    elif status_code in (500, 502, 503, 504):
+                        if attempt < max_retries:
+                            wait_time = backoff_factor ** attempt
+                            logger.warning(
+                                "Gemini upstream server error (%d). Retrying in %.2fs (attempt %d/%d)...",
+                                status_code, wait_time, attempt, max_retries
+                            )
+                            await asyncio.sleep(wait_time)
+                            continue
+                        raise AIProviderAPIError(self.provider_name, status_code, detail)
+
+                    elif status_code in (400, 401, 403):
+                        # Client-side configuration errors (e.g. invalid API key or model name)
+                        logger.error("Gemini client error (%d): %s", status_code, detail)
+                        raise AIProviderAPIError(self.provider_name, status_code, detail)
+
+                    else:
+                        raise AIProviderAPIError(self.provider_name, status_code, detail)
+
+            except httpx.TimeoutException:
+                elapsed = time.time() - start_time
+                if attempt < max_retries:
+                    wait_time = backoff_factor ** attempt
+                    logger.warning(
+                        "Gemini request timed out after %.2fs. Retrying in %.2fs (attempt %d/%d)...",
+                        elapsed, wait_time, attempt, max_retries
+                    )
+                    await asyncio.sleep(wait_time)
+                    continue
+                raise AIProviderTimeoutError(self.provider_name, timeout)
+
+            except httpx.NetworkError as net_err:
+                if attempt < max_retries:
+                    wait_time = backoff_factor ** attempt
+                    logger.warning(
+                        "Gemini network error: %s. Retrying in %.2fs...",
+                        str(net_err), wait_time
+                    )
+                    await asyncio.sleep(wait_time)
+                    continue
+                raise AIProviderAPIError(
+                    self.provider_name,
+                    status_code=503,
+                    detail=f"Network connectivity error contacting Gemini API: {str(net_err)}"
+                )
+
+        raise AIProviderError(
+            message=f"Gemini API request failed after {max_retries} attempts.",
+            provider=self.provider_name,
+            status_code=500
+        )
+
+    async def stream_response(
+        self,
+        messages: List[Dict[str, str]],
+        system_prompt: str,
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+    ) -> AsyncGenerator[str, None]:
+        if not self.api_key or not self.api_key.strip():
+            raise AIProviderMissingKeyError(self.provider_name)
+
+        gemini_model = model or settings.DEFAULT_FAST_MODEL
+        contents = []
+        for m in messages:
+            role = "user" if m.get("role") == "user" else "model"
+            contents.append({"role": role, "parts": [{"text": m.get("content", "")}]})
+
+        payload = {
+            "contents": contents,
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "generationConfig": {"temperature": temperature}
+        }
+        url = f"{self.base_url}/models/{gemini_model}:streamGenerateContent?alt=sse&key={self.api_key}"
+        timeout = settings.AI_REQUEST_TIMEOUT_SECONDS
+
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream("POST", url, json=payload) as resp:
+                if resp.status_code != 200:
+                    raw_err = await resp.aread()
+                    raise AIProviderAPIError(self.provider_name, resp.status_code, raw_err.decode("utf-8", errors="ignore"))
+
+                async for line in resp.aiter_lines():
+                    if line.startswith("data: "):
+                        data_str = line[6:].strip()
+                        if not data_str:
+                            continue
+                        try:
+                            chunk = json.loads(data_str)
+                            candidates = chunk.get("candidates", [])
+                            if candidates:
+                                parts = candidates[0].get("content", {}).get("parts", [])
+                                for p in parts:
+                                    t = p.get("text", "")
+                                    if t:
+                                        yield t
+                        except Exception:
+                            continue
+
+
+# ==============================================================================
+# OpenAI Provider (Architecture Ready — Not Activated in Phase 2A)
+# ==============================================================================
+
 class OpenAIProvider(BaseLLMProvider):
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or settings.OPENAI_API_KEY
         self.base_url = "https://api.openai.com/v1"
+        self.provider_name = "openai"
 
     async def generate_response(
         self,
@@ -43,8 +338,8 @@ class OpenAIProvider(BaseLLMProvider):
         tools: Optional[List[Dict[str, Any]]] = None
     ) -> Dict[str, Any]:
         if not self.api_key:
-            raise ValueError("OpenAI API key is not configured.")
-        
+            raise AIProviderMissingKeyError(self.provider_name)
+
         formatted_messages = [{"role": "system", "content": system_prompt}] + messages
         payload: Dict[str, Any] = {
             "model": model or "gpt-4o-mini",
@@ -54,18 +349,19 @@ class OpenAIProvider(BaseLLMProvider):
         if tools:
             payload["tools"] = tools
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=settings.AI_REQUEST_TIMEOUT_SECONDS) as client:
             resp = await client.post(
                 f"{self.base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {self.api_key}"},
                 json=payload
             )
-            resp.raise_for_status()
+            if resp.status_code != 200:
+                raise AIProviderAPIError(self.provider_name, resp.status_code, resp.text)
             data = resp.json()
             choice = data["choices"][0]["message"]
             return {
                 "content": choice.get("content", ""),
-                "provider": "openai",
+                "provider": self.provider_name,
                 "model": data.get("model", model),
                 "tokens_used": data.get("usage", {}).get("total_tokens", 0),
                 "tool_calls": choice.get("tool_calls", [])
@@ -79,8 +375,8 @@ class OpenAIProvider(BaseLLMProvider):
         temperature: float = 0.7,
     ) -> AsyncGenerator[str, None]:
         if not self.api_key:
-            raise ValueError("OpenAI API key is not configured.")
-        
+            raise AIProviderMissingKeyError(self.provider_name)
+
         formatted_messages = [{"role": "system", "content": system_prompt}] + messages
         payload = {
             "model": model or "gpt-4o-mini",
@@ -88,14 +384,16 @@ class OpenAIProvider(BaseLLMProvider):
             "temperature": temperature,
             "stream": True,
         }
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=settings.AI_REQUEST_TIMEOUT_SECONDS) as client:
             async with client.stream(
                 "POST",
                 f"{self.base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {self.api_key}"},
                 json=payload
             ) as resp:
-                resp.raise_for_status()
+                if resp.status_code != 200:
+                    raw_err = await resp.aread()
+                    raise AIProviderAPIError(self.provider_name, resp.status_code, raw_err.decode("utf-8", errors="ignore"))
                 async for line in resp.aiter_lines():
                     if line.startswith("data: ") and line != "data: [DONE]":
                         try:
@@ -106,70 +404,16 @@ class OpenAIProvider(BaseLLMProvider):
                         except Exception:
                             continue
 
-class GeminiProvider(BaseLLMProvider):
-    def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or settings.GOOGLE_API_KEY
-        self.base_url = "https://generativelanguage.googleapis.com/v1beta"
 
-    async def generate_response(
-        self,
-        messages: List[Dict[str, str]],
-        system_prompt: str,
-        model: Optional[str] = None,
-        temperature: float = 0.7,
-        tools: Optional[List[Dict[str, Any]]] = None
-    ) -> Dict[str, Any]:
-        if not self.api_key:
-            raise ValueError("Google Gemini API key is not configured.")
-
-        gemini_model = model or "gemini-2.5-flash"
-        contents = []
-        for m in messages:
-            role = "user" if m["role"] == "user" else "model"
-            contents.append({"role": role, "parts": [{"text": m["content"]}]})
-
-        payload: Dict[str, Any] = {
-            "contents": contents,
-            "systemInstruction": {"parts": [{"text": system_prompt}]},
-            "generationConfig": {"temperature": temperature}
-        }
-
-        url = f"{self.base_url}/models/{gemini_model}:generateContent?key={self.api_key}"
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(url, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            candidates = data.get("candidates", [])
-            text = ""
-            if candidates and "content" in candidates[0]:
-                parts = candidates[0]["content"].get("parts", [])
-                text = "".join(p.get("text", "") for p in parts)
-            tokens = data.get("usageMetadata", {}).get("totalTokenCount", 0)
-            return {
-                "content": text,
-                "provider": "gemini",
-                "model": gemini_model,
-                "tokens_used": tokens,
-                "tool_calls": []
-            }
-
-    async def stream_response(
-        self,
-        messages: List[Dict[str, str]],
-        system_prompt: str,
-        model: Optional[str] = None,
-        temperature: float = 0.7,
-    ) -> AsyncGenerator[str, None]:
-        # For simplicity and reliability in SSE streaming, yield full response or stream chunks
-        res = await self.generate_response(messages, system_prompt, model, temperature)
-        words = res["content"].split(" ")
-        for i, word in enumerate(words):
-            yield word + (" " if i < len(words) - 1 else "")
+# ==============================================================================
+# Anthropic Provider (Architecture Ready — Not Activated in Phase 2A)
+# ==============================================================================
 
 class AnthropicProvider(BaseLLMProvider):
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or settings.ANTHROPIC_API_KEY
         self.base_url = "https://api.anthropic.com/v1"
+        self.provider_name = "anthropic"
 
     async def generate_response(
         self,
@@ -180,12 +424,10 @@ class AnthropicProvider(BaseLLMProvider):
         tools: Optional[List[Dict[str, Any]]] = None
     ) -> Dict[str, Any]:
         if not self.api_key:
-            raise ValueError("Anthropic API key is not configured.")
+            raise AIProviderMissingKeyError(self.provider_name)
 
         claude_model = model or "claude-3-5-sonnet-20241022"
-        formatted_messages = []
-        for m in messages:
-            formatted_messages.append({"role": m["role"], "content": m["content"]})
+        formatted_messages = [{"role": m["role"], "content": m["content"]} for m in messages]
 
         payload = {
             "model": claude_model,
@@ -195,7 +437,7 @@ class AnthropicProvider(BaseLLMProvider):
             "temperature": temperature,
         }
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=settings.AI_REQUEST_TIMEOUT_SECONDS) as client:
             resp = await client.post(
                 f"{self.base_url}/messages",
                 headers={
@@ -205,14 +447,15 @@ class AnthropicProvider(BaseLLMProvider):
                 },
                 json=payload
             )
-            resp.raise_for_status()
+            if resp.status_code != 200:
+                raise AIProviderAPIError(self.provider_name, resp.status_code, resp.text)
             data = resp.json()
             content_blocks = data.get("content", [])
             text = "".join(b.get("text", "") for b in content_blocks if b.get("type") == "text")
             tokens = data.get("usage", {}).get("input_tokens", 0) + data.get("usage", {}).get("output_tokens", 0)
             return {
                 "content": text,
-                "provider": "anthropic",
+                "provider": self.provider_name,
                 "model": claude_model,
                 "tokens_used": tokens,
                 "tool_calls": []
@@ -230,12 +473,20 @@ class AnthropicProvider(BaseLLMProvider):
         for i, word in enumerate(words):
             yield word + (" " if i < len(words) - 1 else "")
 
+
+# ==============================================================================
+# Mock Provider (Controlled Local Developer Simulator & Offline Testing)
+# ==============================================================================
+
 class MockProvider(BaseLLMProvider):
     """
     Intelligent Executive Fallback & Demo Engine.
-    Employs executive reasoning to analyze intent and return realistic, structured executive outputs
-    when upstream API keys are not provided.
+    Strictly prohibited in production mode. Activated only when ALLOW_MOCK_FALLBACK=True
+    in non-production environments.
     """
+    def __init__(self):
+        self.provider_name = "mock"
+
     async def generate_response(
         self,
         messages: List[Dict[str, str]],
@@ -245,7 +496,7 @@ class MockProvider(BaseLLMProvider):
         tools: Optional[List[Dict[str, Any]]] = None
     ) -> Dict[str, Any]:
         last_message = messages[-1]["content"].lower() if messages else ""
-        
+
         # Parse execution_results from system_prompt if available
         exec_results = []
         if "Execution Results:\n" in system_prompt:
@@ -255,7 +506,6 @@ class MockProvider(BaseLLMProvider):
             except Exception:
                 exec_results = []
 
-        # Check for dynamic execution results first
         for item in exec_results:
             domain = item.get("domain")
             action = item.get("action")
@@ -263,10 +513,10 @@ class MockProvider(BaseLLMProvider):
             if domain == "memory" and action == "stored":
                 fact = item.get("fact", "your preference")
                 content = (
-                    f"### 🧠 Preference Stored\n\n"
-                    f"I have committed this to your persistent executive memory bank:\n"
+                    f"### 🧠 Preference Stored (Simulation Mode)\n\n"
+                    f"I have committed this to your executive memory bank:\n"
                     f"> **\"{fact}\"**\n\n"
-                    f"I will strictly respect this preference across all future conversations."
+                    f"I will respect this preference across future conversations."
                 )
                 return {"content": content, "provider": "mock", "model": "technopie-mock-v1", "tokens_used": 60, "tool_calls": []}
 
@@ -275,7 +525,7 @@ class MockProvider(BaseLLMProvider):
                 matched = [f for f in facts if "language" in f.lower() or "english" in f.lower() or "hindi" in f.lower()]
                 pref_text = matched[0] if matched else "English"
                 content = (
-                    f"### 🧠 Recalled Preference\n\n"
+                    f"### 🧠 Recalled Preference (Simulation Mode)\n\n"
                     f"According to your personal memory bank, your preferred language is **{pref_text}**.\n\n"
                     f"I will ensure all future briefings and drafts are formatted accordingly."
                 )
@@ -286,7 +536,7 @@ class MockProvider(BaseLLMProvider):
                 priority = item.get("priority", "medium").upper()
                 due = item.get("due_date", "Tomorrow")
                 content = (
-                    f"### 📋 Task Created Successfully\n\n"
+                    f"### 📋 Task Created Successfully (Simulation Mode)\n\n"
                     f"I have added the task to your deliverables:\n"
                     f"- **Title:** {title}\n"
                     f"- **Priority:** {priority}\n"
@@ -302,7 +552,7 @@ class MockProvider(BaseLLMProvider):
                     lines.append(f"{idx}. **{t['title']}** [{t['priority'].upper()}] - Status: {t['status']}")
                 task_lines = "\n".join(lines) if lines else "No pending tasks recorded."
                 content = (
-                    f"### 📋 Priority & Task Management Report\n\n"
+                    f"### 📋 Priority & Task Management Report (Simulation Mode)\n\n"
                     f"I have audited your active task board and cross-referenced deadlines:\n\n"
                     f"{task_lines}\n\n"
                     f"**Recommendation:** Focus first on high and urgent deliverables before proceeding to lower-priority items."
@@ -311,7 +561,7 @@ class MockProvider(BaseLLMProvider):
 
             elif domain == "research":
                 content = (
-                    "### 🔍 Competitive Intelligence: Top 5 AI Assistant SaaS Competitors\n\n"
+                    "### 🔍 Competitive Intelligence: Top 5 AI Assistant SaaS Competitors (Simulation Mode)\n\n"
                     "I have synthesized a multi-source comparative analysis across five leading executive AI assistant platforms:\n\n"
                     "1. **Motion (usemotion.com):** Specializes in algorithmic calendar time-blocking and automated schedule recovery.\n"
                     "2. **Superhuman AI:** High-speed executive email triage, thread prioritization, and instant drafting.\n"
@@ -325,51 +575,12 @@ class MockProvider(BaseLLMProvider):
                 )
                 return {"content": content, "provider": "mock", "model": "technopie-mock-v1", "tokens_used": 320, "tool_calls": []}
 
-        # Fallback keyword matching
-        if any(w in last_message for w in ["schedule", "tomorrow", "calendar", "agenda", "meeting"]):
-            content = (
-                "### 📅 Executive Daily Briefing & Schedule Analysis\n\n"
-                "I have reviewed your calendar, extracted priorities, and analyzed upcoming commitments:\n\n"
-                "**1. Schedule for Tomorrow:**\n"
-                "- **09:30 AM – 10:15 AM:** Q3 Strategy Alignment with Executive Committee *(Zoom)*\n"
-                "- **11:30 AM – 12:15 PM:** Investor Briefing & Financial Projections Review\n"
-                "- **02:00 PM – 03:00 PM:** Focus Time: Review Enterprise SaaS Proposal & Security Audit\n"
-                "- **04:30 PM – 05:00 PM:** Weekly 1:1 Check-in with Chief of Product\n\n"
-                "**2. Key Attention Items:**\n"
-                "- ⚠️ **Conflict Alert:** A tentative lunch meeting at 12:45 PM overlaps with travel time before your 2:00 PM deep work block.\n"
-                "- ✉️ **Pending Reply:** Awaiting your approval to send follow-up emails regarding the AI adoption roadmap.\n\n"
-                "Would you like me to reschedule the 12:45 PM tentative slot or prepare talking points for the 9:30 AM alignment call?"
-            )
-        elif any(w in last_message for w in ["email", "inbox", "gmail", "reply"]):
-            content = (
-                "### ✉️ Executive Email Intelligence\n\n"
-                "I have scanned your authorized inbox and categorized recent communications:\n\n"
-                "1. **VIP Client — Apex Ventures:** Requested updated financial model by tomorrow noon.\n"
-                "   - *Action:* Draft reply prepared with attached Q3 metrics.\n"
-                "2. **Legal Counsel:** Sent revised NDA for European acquisition.\n"
-                "   - *Action:* Marked for your direct sign-off.\n"
-                "3. **Vendor Renewal Notice:** AWS Enterprise contract review due in 5 days.\n\n"
-                "> 🔒 *Safety Gate:* Sending external replies requires your explicit approval. You can review and confirm drafts in the Emails workspace."
-            )
-        elif any(w in last_message for w in ["document", "proposal", "report", "docx", "pdf", "generate"]):
-            content = (
-                "### 📄 Document Ready for Generation\n\n"
-                "I have structured the requested executive document based on your parameters:\n\n"
-                "- **Title:** Technopie AI Enterprise Strategy Document\n"
-                "- **Format:** Microsoft Word (.docx) & Executive PDF\n"
-                "- **Sections:** Executive Summary, Architecture Breakdown, Market Opportunity, Financial Forecast\n\n"
-                "You can generate and download the completed file directly using the Document Assistant."
-            )
-        else:
-            content = (
-                "Hello Alexander. I am your **Technopie AI Executive Assistant**.\n\n"
-                "I am actively monitoring your calendar, prioritizing pending tasks, and ready to assist with:\n\n"
-                "- **Executive Scheduling:** Analyzing calendar conflicts and optimizing your day\n"
-                "- **Inbox Management:** Categorizing VIP emails and preparing professional draft replies\n"
-                "- **Task Automation:** Converting instructions into prioritized actions\n"
-                "- **Deep Research & Documents:** Producing proposals, reports, and strategic briefs\n\n"
-                "How would you like to direct your assistant right now?"
-            )
+        # Fallback responses for general prompts
+        content = (
+            "Hello. I am your **Technopie AI Executive Assistant** (Running in Local Development Mock Mode).\n\n"
+            "To connect real generative intelligence, set `GOOGLE_API_KEY` in your environment configuration.\n"
+            "I am ready to assist with scheduling, email triage, task management, and document generation."
+        )
 
         return {
             "content": content,
@@ -391,10 +602,15 @@ class MockProvider(BaseLLMProvider):
         for i, word in enumerate(words):
             yield word + (" " if i < len(words) - 1 else "")
 
+
+# ==============================================================================
+# Model Router (Multi-Provider Abstraction & Policy Enforcement)
+# ==============================================================================
+
 class AIModelRouter:
     """
-    Central router that dynamically selects the optimal model provider
-    based on task type, availability, and fallback cascading.
+    Central router that dynamically selects the optimal model provider.
+    Enforces strict production policies: NEVER silently cascades to MockProvider.
     """
     def __init__(self):
         self.openai = OpenAIProvider()
@@ -404,22 +620,55 @@ class AIModelRouter:
 
     def get_provider(self, requested_provider: Optional[str] = None) -> BaseLLMProvider:
         prov = (requested_provider or settings.DEFAULT_AI_PROVIDER).lower()
-        if prov == "gemini" and settings.GOOGLE_API_KEY:
-            return self.gemini
-        elif prov == "openai" and settings.OPENAI_API_KEY:
-            return self.openai
-        elif prov == "anthropic" and settings.ANTHROPIC_API_KEY:
-            return self.anthropic
-        
-        # Fallback cascade: check if any configured
-        if settings.GOOGLE_API_KEY:
-            return self.gemini
-        if settings.OPENAI_API_KEY:
-            return self.openai
-        if settings.ANTHROPIC_API_KEY:
-            return self.anthropic
-        
-        # Default to intelligent mock provider
-        return self.mock
+
+        # 1. Explicit Mock Provider Request
+        if prov == "mock":
+            if settings.ENVIRONMENT == "production":
+                raise AIProviderError(
+                    message="Mock AI provider is strictly prohibited in production mode. Configure a real provider (Google Gemini).",
+                    provider="mock",
+                    status_code=403
+                )
+            return self.mock
+
+        # 2. Google Gemini (Active Primary Foundation Provider in Phase 2A)
+        if prov == "gemini":
+            if settings.GOOGLE_API_KEY and settings.GOOGLE_API_KEY.strip():
+                return self.gemini
+            # Strict Policy: If key is missing, check if mock fallback is explicitly permitted
+            if settings.ALLOW_MOCK_FALLBACK and settings.ENVIRONMENT != "production":
+                logger.warning(
+                    "GOOGLE_API_KEY is not configured; falling back to MockProvider because ALLOW_MOCK_FALLBACK is enabled in development."
+                )
+                return self.mock
+            raise AIProviderMissingKeyError(
+                provider="gemini",
+                message="Google Gemini API key is missing. Set GOOGLE_API_KEY in your backend/.env file to enable real AI assistant capabilities."
+            )
+
+        # 3. OpenAI (Architecture Ready — Not Activated in Phase 2A)
+        if prov == "openai":
+            if settings.OPENAI_API_KEY and settings.OPENAI_API_KEY.strip():
+                return self.openai
+            raise AIProviderMissingKeyError(
+                provider="openai",
+                message="OpenAI provider is not active or OPENAI_API_KEY is missing."
+            )
+
+        # 4. Anthropic (Architecture Ready — Not Activated in Phase 2A)
+        if prov == "anthropic":
+            if settings.ANTHROPIC_API_KEY and settings.ANTHROPIC_API_KEY.strip():
+                return self.anthropic
+            raise AIProviderMissingKeyError(
+                provider="anthropic",
+                message="Anthropic provider is not active or ANTHROPIC_API_KEY is missing."
+            )
+
+        # 5. Unsupported Provider
+        raise AIProviderError(
+            message=f"Unsupported AI provider '{requested_provider}'. Supported providers: gemini, openai, anthropic, mock.",
+            provider=prov,
+            status_code=400
+        )
 
 model_router = AIModelRouter()

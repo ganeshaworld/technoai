@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     DEFAULT_AI_PROVIDER: str = "gemini" # gemini | openai | anthropic | mock
     DEFAULT_FAST_MODEL: str = "gemini-2.5-flash"
     DEFAULT_REASONING_MODEL: str = "gemini-2.5-pro"
+    ALLOW_MOCK_FALLBACK: bool = False
+    AI_REQUEST_TIMEOUT_SECONDS: float = 30.0
+    AI_MAX_RETRIES: int = 3
+    AI_RETRY_BACKOFF_FACTOR: float = 1.5
     
     OPENAI_API_KEY: str = ""
     GOOGLE_API_KEY: str = ""

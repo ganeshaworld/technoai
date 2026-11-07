@@ -3,7 +3,7 @@ import re
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
-from backend.app.services.ai_providers import model_router
+from backend.app.services.ai_providers import model_router, AIProviderError, AIProviderMissingKeyError
 from backend.app.services.memory_service import MemoryService
 from backend.app.services.task_service import TaskService
 from backend.app.services.calendar_service import CalendarService
@@ -157,21 +157,49 @@ class CentralAIBrain:
             f"Execution Results:\n{json.dumps(execution_results, default=str)}\n"
         )
 
-        provider = model_router.get_provider(provider_name)
-        llm_response = await provider.generate_response(
-            messages=[{"role": "user", "content": prompt}],
-            system_prompt=system_prompt
-        )
+        try:
+            provider = model_router.get_provider(provider_name)
+            llm_response = await provider.generate_response(
+                messages=[{"role": "user", "content": prompt}],
+                system_prompt=system_prompt
+            )
+            report_text = llm_response["content"]
+            model_prov = llm_response.get("provider", "gemini")
+            model_n = llm_response.get("model", "gemini-2.5-flash")
+            tokens_used = llm_response.get("tokens_used", 0)
+
+        except AIProviderMissingKeyError as err:
+            report_text = (
+                "⚠️ **AI Provider Configuration Required**\n\n"
+                f"{err.message}\n\n"
+                "**Executive Safety Notice:** Technopie AI enforces strict architectural integrity. "
+                "Simulated mock fallbacks are disabled in production to ensure all strategic actions, "
+                "email drafts, and briefings are derived from genuine foundation model inference.\n\n"
+                "> 💡 **Action Item:** Add `GOOGLE_API_KEY=your_key` to your environment configuration to enable real-time intelligence."
+            )
+            model_prov = "unconfigured"
+            model_n = "none"
+            tokens_used = 0
+
+        except AIProviderError as err:
+            report_text = (
+                f"⚠️ **AI Foundation Service Unavailable ({err.provider.upper()})**\n\n"
+                f"{err.message}\n\n"
+                "Your executed tools and saved records remain persistent. Please verify your API key and connection."
+            )
+            model_prov = "error"
+            model_n = "none"
+            tokens_used = 0
 
         return {
             "intent": intent,
             "plan_steps": plan_steps,
             "execution_results": execution_results,
             "action_required": action_required,
-            "report": llm_response["content"],
-            "model_provider": llm_response.get("provider", "gemini"),
-            "model_name": llm_response.get("model", "gemini-2.5-flash"),
-            "tokens_used": llm_response.get("tokens_used", 0)
+            "report": report_text,
+            "model_provider": model_prov,
+            "model_name": model_n,
+            "tokens_used": tokens_used
         }
 
     @staticmethod

@@ -12,8 +12,37 @@ from backend.app.db.models import User, Conversation, Message, UserProfile
 from backend.app.core.security import get_current_user
 from backend.app.agents.orchestrator import CentralAIBrain
 from backend.app.services.ai_providers import model_router
+from backend.app.config import settings
 
 router = APIRouter(prefix="/chat", tags=["AI Conversations & Assistant"])
+
+@router.get("/provider-status")
+async def get_provider_status(user: User = Depends(get_current_user)):
+    return {
+        "default_provider": settings.DEFAULT_AI_PROVIDER,
+        "environment": settings.ENVIRONMENT,
+        "allow_mock_fallback": settings.ALLOW_MOCK_FALLBACK,
+        "providers": {
+            "gemini": {
+                "active": True,
+                "configured": bool(settings.GOOGLE_API_KEY and settings.GOOGLE_API_KEY.strip()),
+                "fast_model": settings.DEFAULT_FAST_MODEL,
+                "reasoning_model": settings.DEFAULT_REASONING_MODEL,
+                "timeout_seconds": settings.AI_REQUEST_TIMEOUT_SECONDS,
+                "max_retries": settings.AI_MAX_RETRIES
+            },
+            "openai": {
+                "active": False,
+                "configured": bool(settings.OPENAI_API_KEY and settings.OPENAI_API_KEY.strip()),
+                "model": "gpt-4o-mini"
+            },
+            "anthropic": {
+                "active": False,
+                "configured": bool(settings.ANTHROPIC_API_KEY and settings.ANTHROPIC_API_KEY.strip()),
+                "model": "claude-3-5-sonnet-20241022"
+            }
+        }
+    }
 
 class CreateConversationRequest(BaseModel):
     title: Optional[str] = "Executive Session"

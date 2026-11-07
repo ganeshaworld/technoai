@@ -115,27 +115,38 @@ async def test_memory_crud():
 
 @pytest.mark.asyncio
 async def test_ai_brain_scenarios():
-    """Verify AI-01 and AI-02 fixes: Natural language memory and task creation."""
+    """Verify AI-01 and AI-02 fixes, plus Phase 2A policy enforcement."""
     token = await get_auth_token("ai_user@technopie.ai")
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test", headers={"Authorization": f"Bearer {token}"}) as ac:
-        # 1. Store memory
-        r_store = await ac.post("/api/chat/message", json={
+        # 1. Unconfigured real provider notification (Phase 2A enforcement: no silent mock fallback)
+        r_unconf = await ac.post("/api/chat/message", json={
             "message": "Remember that my preferred language is English."
+        })
+        assert r_unconf.status_code == 200
+        assert "AI Provider Configuration Required" in r_unconf.json()["content"]
+        assert r_unconf.json()["model_provider"] == "unconfigured"
+
+        # 2. Store memory with explicit mock provider in development mode
+        r_store = await ac.post("/api/chat/message", json={
+            "message": "Remember that my preferred language is English.",
+            "provider": "mock"
         })
         assert r_store.status_code == 200
         assert "Preference Stored" in r_store.json()["content"]
 
-        # 2. Recall memory
+        # 3. Recall memory with explicit mock provider
         r_recall = await ac.post("/api/chat/message", json={
-            "message": "What is my preferred language?"
+            "message": "What is my preferred language?",
+            "provider": "mock"
         })
         assert r_recall.status_code == 200
         assert "English" in r_recall.json()["content"]
 
-        # 3. Create task with temporal parameter
+        # 4. Create task with temporal parameter
         r_task = await ac.post("/api/chat/message", json={
-            "message": "Create a task to prepare a business proposal tomorrow."
+            "message": "Create a task to prepare a business proposal tomorrow.",
+            "provider": "mock"
         })
         assert r_task.status_code == 200
         assert "Task Created Successfully" in r_task.json()["content"]
