@@ -80,9 +80,9 @@ async def list_integrations(user: User = Depends(get_current_user)):
             "id": "google_workspace",
             "name": "Google Workspace (Gmail & Calendar)",
             "category": "Productivity",
-            "status": "connected", # connected | available | disconnected
-            "account_email": user.email,
-            "connected_at": "2026-10-15T10:00:00Z",
+            "status": "available", # available until OAuth exchange succeeds
+            "account_email": None,
+            "connected_at": None,
             "scopes": ["gmail.readonly", "gmail.compose", "calendar.events"]
         },
         {

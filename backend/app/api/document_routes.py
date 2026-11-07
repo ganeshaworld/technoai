@@ -89,13 +89,14 @@ async def generate_document(
 @router.get("/{document_id}/download")
 async def download_document(
     document_id: str,
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    stmt = select(Document).where(Document.id == document_id)
+    stmt = select(Document).where(Document.id == document_id, Document.user_id == user.id)
     result = await db.execute(stmt)
     doc = result.scalars().first()
     if not doc or not os.path.exists(doc.file_path):
-        raise HTTPException(status_code=404, detail="File not found.")
+        raise HTTPException(status_code=404, detail="Document not found or access denied.")
 
     media_types = {
         "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",

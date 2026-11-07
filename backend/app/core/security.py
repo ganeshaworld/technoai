@@ -44,41 +44,30 @@ async def get_current_user_optional(
     token: Optional[str] = Depends(oauth2_scheme),
     db: AsyncSession = Depends(get_db)
 ):
-    from backend.app.db.models import User, UserProfile
-    
-    # If no token provided, return or create a default guest/demo executive user for seamless zero-barrier usage
     if not token:
-        # Check if default demo user exists
-        stmt = select(User).where(User.email == "demo@technopie.ai")
-        result = await db.execute(stmt)
-        user = result.scalars().first()
-        if not user:
-            user = User(
-                email="demo@technopie.ai",
-                hashed_password=hash_password("DemoPassword123!"),
-                is_active=True,
-                is_verified=True,
-                is_superuser=False
-            )
-            db.add(user)
-            await db.flush()
-            profile = UserProfile(
-                user_id=user.id,
-                full_name="Alexander Vance",
-                preferred_name="Alexander",
-                profession="Founder & Managing Director",
-                work_description="Directing corporate strategy, international expansion and investment portfolio.",
-                preferred_language="en",
-                timezone="UTC",
-                productivity_goals=["Zero inbox by 6 PM", "Morning schedule briefings", "High-priority meeting prep"],
-                ai_tone_preference="executive",
-                onboarding_completed=True
-            )
-            db.add(profile)
-            await db.commit()
-            await db.refresh(user)
-        return user
+        return None
 
+    payload = decode_access_token(token)
+    if not payload:
+        return None
+    user_id: str = payload.get("sub")
+    if not user_id:
+        return None
+    from backend.app.db.models import User
+    stmt = select(User).where(User.id == user_id)
+    result = await db.execute(stmt)
+    return result.scalars().first()
+
+async def get_current_user(
+    token: Optional[str] = Depends(oauth2_scheme),
+    db: AsyncSession = Depends(get_db)
+):
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     payload = decode_access_token(token)
     if not payload:
         raise HTTPException(
@@ -87,19 +76,16 @@ async def get_current_user_optional(
             headers={"WWW-Authenticate": "Bearer"},
         )
     user_id: str = payload.get("sub")
-    if user_id is None:
+    if not user_id:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token payload",
+            headers={"WWW-Authenticate": "Bearer"},
         )
+    from backend.app.db.models import User
     stmt = select(User).where(User.id == user_id)
     result = await db.execute(stmt)
     user = result.scalars().first()
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-    return user
-
-async def get_current_user(user = Depends(get_current_user_optional)):
-    if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
     return user

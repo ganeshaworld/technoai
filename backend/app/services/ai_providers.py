@@ -245,7 +245,87 @@ class MockProvider(BaseLLMProvider):
         tools: Optional[List[Dict[str, Any]]] = None
     ) -> Dict[str, Any]:
         last_message = messages[-1]["content"].lower() if messages else ""
+        
+        # Parse execution_results from system_prompt if available
+        exec_results = []
+        if "Execution Results:\n" in system_prompt:
+            try:
+                raw_json = system_prompt.split("Execution Results:\n")[1].strip()
+                exec_results = json.loads(raw_json)
+            except Exception:
+                exec_results = []
 
+        # Check for dynamic execution results first
+        for item in exec_results:
+            domain = item.get("domain")
+            action = item.get("action")
+
+            if domain == "memory" and action == "stored":
+                fact = item.get("fact", "your preference")
+                content = (
+                    f"### 🧠 Preference Stored\n\n"
+                    f"I have committed this to your persistent executive memory bank:\n"
+                    f"> **\"{fact}\"**\n\n"
+                    f"I will strictly respect this preference across all future conversations."
+                )
+                return {"content": content, "provider": "mock", "model": "technopie-mock-v1", "tokens_used": 60, "tool_calls": []}
+
+            elif domain == "memory" and action == "recalled":
+                facts = item.get("facts", [])
+                matched = [f for f in facts if "language" in f.lower() or "english" in f.lower() or "hindi" in f.lower()]
+                pref_text = matched[0] if matched else "English"
+                content = (
+                    f"### 🧠 Recalled Preference\n\n"
+                    f"According to your personal memory bank, your preferred language is **{pref_text}**.\n\n"
+                    f"I will ensure all future briefings and drafts are formatted accordingly."
+                )
+                return {"content": content, "provider": "mock", "model": "technopie-mock-v1", "tokens_used": 65, "tool_calls": []}
+
+            elif domain == "tasks" and action == "created":
+                title = item.get("task_title", "New Task")
+                priority = item.get("priority", "medium").upper()
+                due = item.get("due_date", "Tomorrow")
+                content = (
+                    f"### 📋 Task Created Successfully\n\n"
+                    f"I have added the task to your deliverables:\n"
+                    f"- **Title:** {title}\n"
+                    f"- **Priority:** {priority}\n"
+                    f"- **Due Date:** {due}\n\n"
+                    f"You can view and manage it on your Tasks board."
+                )
+                return {"content": content, "provider": "mock", "model": "technopie-mock-v1", "tokens_used": 75, "tool_calls": []}
+
+            elif domain == "tasks" and action == "analyzed":
+                tasks = item.get("task_list", [])
+                lines = []
+                for idx, t in enumerate(tasks[:5], 1):
+                    lines.append(f"{idx}. **{t['title']}** [{t['priority'].upper()}] - Status: {t['status']}")
+                task_lines = "\n".join(lines) if lines else "No pending tasks recorded."
+                content = (
+                    f"### 📋 Priority & Task Management Report\n\n"
+                    f"I have audited your active task board and cross-referenced deadlines:\n\n"
+                    f"{task_lines}\n\n"
+                    f"**Recommendation:** Focus first on high and urgent deliverables before proceeding to lower-priority items."
+                )
+                return {"content": content, "provider": "mock", "model": "technopie-mock-v1", "tokens_used": 150, "tool_calls": []}
+
+            elif domain == "research":
+                content = (
+                    "### 🔍 Competitive Intelligence: Top 5 AI Assistant SaaS Competitors\n\n"
+                    "I have synthesized a multi-source comparative analysis across five leading executive AI assistant platforms:\n\n"
+                    "1. **Motion (usemotion.com):** Specializes in algorithmic calendar time-blocking and automated schedule recovery.\n"
+                    "2. **Superhuman AI:** High-speed executive email triage, thread prioritization, and instant drafting.\n"
+                    "3. **Lindsa / Lindy.ai:** Autonomous personal agents for scheduling, email workflows, and integrations.\n"
+                    "4. **Otter.ai:** AI meeting assistant focused on automated transcription, action-item extraction, and executive summaries.\n"
+                    "5. **Microsoft Copilot for M365:** Enterprise assistant embedded across Word, Excel, Teams, and Outlook.\n\n"
+                    "**Epistemic Analysis:**\n"
+                    "- **Verified Fact:** Strict Level 3 human approval boundaries prevent unauthorized outbound email dispatch across enterprise platforms.\n"
+                    "- **Estimate:** Executive assistant adoption yields 25%–38% time savings on routine coordination.\n"
+                    "- **Expert Opinion:** Unified executive assistants with persistent memory will replace single-purpose productivity apps by 2028."
+                )
+                return {"content": content, "provider": "mock", "model": "technopie-mock-v1", "tokens_used": 320, "tool_calls": []}
+
+        # Fallback keyword matching
         if any(w in last_message for w in ["schedule", "tomorrow", "calendar", "agenda", "meeting"]):
             content = (
                 "### 📅 Executive Daily Briefing & Schedule Analysis\n\n"
@@ -259,18 +339,6 @@ class MockProvider(BaseLLMProvider):
                 "- ⚠️ **Conflict Alert:** A tentative lunch meeting at 12:45 PM overlaps with travel time before your 2:00 PM deep work block.\n"
                 "- ✉️ **Pending Reply:** Awaiting your approval to send follow-up emails regarding the AI adoption roadmap.\n\n"
                 "Would you like me to reschedule the 12:45 PM tentative slot or prepare talking points for the 9:30 AM alignment call?"
-            )
-        elif any(w in last_message for w in ["task", "todo", "unfinished", "priorit"]):
-            content = (
-                "### 📋 Priority & Task Management Report\n\n"
-                "I have audited your active task board and cross-referenced with your commitments:\n\n"
-                "**🔥 Urgent / High Priority:**\n"
-                "1. **Finalize Master Service Agreement (MSA)** for Global Cloud Expansion *(Due Today at 5:00 PM)*\n"
-                "2. **Review Q3 Executive Deck** with CFO *(High Priority)*\n\n"
-                "**⏳ Upcoming Tasks:**\n"
-                "3. Approve revised marketing budget allocation for APAC launch\n"
-                "4. Consolidate stakeholder feedback on autonomous agent security policy\n\n"
-                "I have prioritized these on your task dashboard. Would you like me to block 45 minutes on your calendar to finish the MSA?"
             )
         elif any(w in last_message for w in ["email", "inbox", "gmail", "reply"]):
             content = (

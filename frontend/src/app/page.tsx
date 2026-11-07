@@ -36,6 +36,23 @@ export default function Home() {
   const [selectedProvider, setSelectedProvider] = useState('gemini');
 
   useEffect(() => {
+    // Ensure an authenticated executive session token exists in localStorage
+    const token = localStorage.getItem('technopie_token');
+    if (!token) {
+      fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'demo@technopie.ai', password: 'DemoPassword123!' })
+      })
+        .then((res) => res.json())
+        .then((data) => {
+          if (data.access_token) {
+            localStorage.setItem('technopie_token', data.access_token);
+          }
+        })
+        .catch((e) => console.warn('Could not auto-login demo executive', e));
+    }
+
     // Check onboarding status in local storage
     const completed = localStorage.getItem('technopie_onboarding_done');
     if (!completed) {

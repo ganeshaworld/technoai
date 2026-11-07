@@ -1,4 +1,6 @@
 import json
+import re
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.services.ai_providers import model_router
@@ -8,7 +10,7 @@ from backend.app.services.calendar_service import CalendarService
 from backend.app.services.email_service import EmailService
 from backend.app.services.document_service import DocumentService
 from backend.app.services.research_service import ResearchService
-from backend.app.core.guardrails import requires_user_confirmation, wrap_untrusted_input
+from backend.app.core.guardrails import requires_user_confirmation, wrap_untrusted_input, inspect_prompt_safety
 
 class CentralAIBrain:
     """
@@ -25,6 +27,23 @@ class CentralAIBrain:
         prompt: str,
         provider_name: Optional[str] = None
     ) -> Dict[str, Any]:
+        # Pre-execution Security & Prompt Safety Screening (SEC-03)
+        is_safe, detected_injections = inspect_prompt_safety(prompt)
+        if not is_safe:
+            return {
+                "intent": "security_violation",
+                "plan_steps": ["Screen prompt security", "Block unauthorized jailbreak/override"],
+                "execution_results": [{"security": "blocked", "patterns": detected_injections}],
+                "action_required": None,
+                "report": (
+                    "⚠️ **Security Alert:** Your instruction contains patterns that conflict with "
+                    f"Technopie AI security policies ({', '.join(detected_injections)}). Request halted."
+                ),
+                "model_provider": "guardrails",
+                "model_name": "prompt-guard-v1",
+                "tokens_used": 0
+            }
+
         # 1. UNDERSTAND: Identify user intent and domain
         intent = CentralAIBrain._classify_intent(prompt)
 
@@ -38,18 +57,25 @@ class CentralAIBrain:
         execution_results = []
         action_required = None
 
-        if intent == "schedule_and_day":
-            # Multi-agent coordination: Calendar + Email + Tasks
-            briefing = await CalendarService.generate_daily_briefing(db, user_id)
-            tasks = await TaskService.list_tasks(db, user_id, view="today")
-            emails = EmailService.get_inbox_messages(user_id)
-            urgent_emails = [e for e in emails if e["category"] in ("action_required", "vip")]
+        if intent == "memory_storage":
+            # Extract memory statement
+            cleaned = re.sub(r"^(?:please\s+)?(?:remember\s+that|note\s+that|save\s+memory[:\s]+)", "", prompt, flags=re.IGNORECASE).strip()
+            if cleaned:
+                mem = await MemoryService.add_memory(
+                    db,
+                    user_id=user_id,
+                    category="preference",
+                    content=cleaned,
+                    is_pinned=True
+                )
+                execution_results.append({"domain": "memory", "action": "stored", "fact": mem.content})
 
-            execution_results.append({"domain": "calendar", "data": briefing})
-            execution_results.append({"domain": "tasks", "total_pending": len(tasks)})
-            execution_results.append({"domain": "emails", "urgent_count": len(urgent_emails)})
+        elif intent == "memory_recall":
+            memories = await MemoryService.get_user_memories(db, user_id)
+            recalled_texts = [m.content for m in memories]
+            execution_results.append({"domain": "memory", "action": "recalled", "facts": recalled_texts})
 
-        elif intent == "task_management":
+        elif intent == "task_creation":
             parsed = TaskService.extract_task_from_text(prompt)
             if parsed and parsed.get("title"):
                 new_task = await TaskService.create_task(
@@ -60,12 +86,35 @@ class CentralAIBrain:
                     due_date=parsed["due_date"],
                     created_by_agent="AI Assistant"
                 )
-                execution_results.append({"domain": "tasks", "created_task": new_task.title})
+                execution_results.append({
+                    "domain": "tasks",
+                    "action": "created",
+                    "task_title": new_task.title,
+                    "priority": new_task.priority,
+                    "due_date": new_task.due_date.isoformat() if new_task.due_date else None
+                })
+
+        elif intent == "task_analysis":
+            tasks = await TaskService.list_tasks(db, user_id, view="all")
+            execution_results.append({
+                "domain": "tasks",
+                "action": "analyzed",
+                "task_list": [{"title": t.title, "priority": t.priority, "status": t.status} for t in tasks]
+            })
+
+        elif intent == "schedule_and_day":
+            briefing = await CalendarService.generate_daily_briefing(db, user_id)
+            tasks = await TaskService.list_tasks(db, user_id, view="today")
+            emails = EmailService.get_inbox_messages(user_id)
+            urgent_emails = [e for e in emails if e["category"] in ("action_required", "vip")]
+
+            execution_results.append({"domain": "calendar", "data": briefing})
+            execution_results.append({"domain": "tasks", "total_pending": len(tasks)})
+            execution_results.append({"domain": "emails", "urgent_count": len(urgent_emails)})
 
         elif intent == "email_triage":
             emails = EmailService.get_inbox_messages(user_id)
             execution_results.append({"domain": "emails", "messages": emails})
-            # Action required gate for external reply dispatch
             action_required = {
                 "action": "send_email",
                 "target": "eleanor@apexpartners.vc",
@@ -97,7 +146,7 @@ class CentralAIBrain:
             research_data = await ResearchService.perform_research(prompt)
             execution_results.append({"domain": "research", "data": research_data})
 
-        # 6. REPORT: Formulate clear executive response using LLM Provider
+        # 6. REPORT: Formulate executive response using Model Provider
         system_prompt = (
             f"You are Technopie AI, an elite Personal and Executive Assistant for {user_name}.\n"
             "Parent Company: Technopie Consultant Pvt. Ltd.\n"
@@ -128,33 +177,73 @@ class CentralAIBrain:
     @staticmethod
     def _classify_intent(prompt: str) -> str:
         p = prompt.lower()
+        # 1. Memory Storage intent
+        if any(p.startswith(w) or f" {w}" in p for w in ["remember that", "note that", "my preference is", "save to memory", "record that"]):
+            return "memory_storage"
+
+        # 2. Memory Recall intent
+        if any(w in p for w in ["what is my preferred", "what do you remember", "recall my preference", "do you know my language"]):
+            return "memory_recall"
+
+        # 3. Explicit Task Creation (Must precede schedule keywords!)
+        if any(w in p for w in ["create a task", "create task", "add task", "remind me to", "todo:"]):
+            return "task_creation"
+
+        # 4. Task Analysis (Must not create tasks!)
+        if any(w in p for w in ["analyze my pending tasks", "analyze my tasks", "prioritize my tasks", "prioritize them", "review tasks"]):
+            return "task_analysis"
+
+        # 5. Schedule & Calendar
         if any(w in p for w in ["organize my day", "schedule", "calendar", "tomorrow", "agenda", "briefing"]):
             return "schedule_and_day"
-        if any(w in p for w in ["task", "todo", "remind me to", "unfinished"]):
-            return "task_management"
+
+        # 6. Emails
         if any(w in p for w in ["email", "inbox", "gmail", "reply", "draft"]):
             return "email_triage"
-        if any(w in p for w in ["document", "proposal", "pdf", "docx", "xlsx", "presentation", "pptx"]):
-            return "document_generation"
+
+        # 7. Research
         if any(w in p for w in ["research", "market", "competitor", "trends", "analysis"]):
             return "deep_research"
+
+        # 8. Document Generation
+        if any(w in p for w in ["document", "proposal", "pdf", "docx", "xlsx", "presentation", "pptx"]):
+            return "document_generation"
+
         return "general_executive_query"
 
     @staticmethod
     def _synthesize_plan(intent: str, prompt: str) -> List[str]:
-        if intent == "schedule_and_day":
+        if intent == "memory_storage":
+            return [
+                "Extract personal preference statement (Level 1: Read)",
+                "Persist in isolated semantic memory bank (Level 2: Prepare)",
+                "Confirm executive memory indexation (Level 2: Prepare)"
+            ]
+        elif intent == "memory_recall":
+            return [
+                "Query semantic memory bank & user profile (Level 1: Read)",
+                "Match relevant preference vectors (Level 1: Read)",
+                "Formulate recalled response (Level 1: Read)"
+            ]
+        elif intent == "task_creation":
+            return [
+                "Parse natural language task parameters & deadline (Level 1: Read)",
+                "Assign executive priority score (Level 2: Prepare)",
+                "Insert record into Task Management engine (Level 2: Prepare)"
+            ]
+        elif intent == "task_analysis":
+            return [
+                "Retrieve active user tasks from database (Level 1: Read)",
+                "Audit deadlines, statuses, and urgency (Level 1: Read)",
+                "Synthesize prioritized executive recommendations (Level 2: Prepare)"
+            ]
+        elif intent == "schedule_and_day":
             return [
                 "Retrieve user schedule & meetings (Level 1: Read)",
                 "Identify potential calendar conflicts (Level 1: Read)",
                 "Scan authorized emails for urgent client requests (Level 1: Read)",
                 "Extract pending and overdue tasks (Level 1: Read)",
                 "Synthesize prioritized daily briefing (Level 2: Prepare)"
-            ]
-        elif intent == "task_management":
-            return [
-                "Parse natural language task parameters (Level 1: Read)",
-                "Assign executive priority score (Level 2: Prepare)",
-                "Insert record into Task Management engine (Level 2: Prepare)"
             ]
         elif intent == "email_triage":
             return [
