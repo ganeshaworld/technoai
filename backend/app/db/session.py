@@ -69,3 +69,37 @@ async def init_db():
                     str(e)
                 )
         await conn.run_sync(Base.metadata.create_all)
+
+    # Automatically ensure default executive demo user exists for seamless frontend session
+    try:
+        from backend.app.db.models import User, UserProfile
+        from backend.app.core.security import hash_password
+        from sqlalchemy.future import select
+
+        async with AsyncSessionLocal() as session:
+            stmt = select(User).where(User.email == "demo@technopie.ai")
+            existing = (await session.execute(stmt)).scalars().first()
+            if not existing:
+                demo_user = User(
+                    email="demo@technopie.ai",
+                    hashed_password=hash_password("DemoPassword123!"),
+                    is_active=True,
+                    is_verified=True,
+                    is_superuser=True
+                )
+                session.add(demo_user)
+                await session.flush()
+
+                demo_profile = UserProfile(
+                    user_id=demo_user.id,
+                    full_name="Alexander Vance",
+                    preferred_name="Alexander",
+                    profession="Chief Technology Executive",
+                    work_description="Managing technology operations and executive workflows",
+                    onboarding_completed=True
+                )
+                session.add(demo_profile)
+                await session.commit()
+                logger.info("Default executive user (demo@technopie.ai) seeded successfully.")
+    except Exception as e:
+        logger.warning("Default user initialization check bypassed: %s", str(e))
