@@ -5,11 +5,18 @@ node_modules/
 __pycache__/
 *.py[cod]
 *$py.class
-*.env
 .venv/
 env/
 venv/
 ENV/
+
+# Environment Variables & Secrets
+.env
+.env.*
+!.env.example
+*.env
+backend/.env
+frontend/.env
 
 # Next.js
 .next/
@@ -24,11 +31,18 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
-# Database & Uploads
+# Database, Backups & File Uploads
+*.sqlite
 *.sqlite3
 *.db
+technopie.db
+backend/technopie.db
+backups/
+backend/backups/
 uploads/
+backend/uploads/
 generated_docs/
+backend/generated_docs/
 
 # IDE & OS
 .idea/
