@@ -15,32 +15,53 @@
    SQLAlchemy's asynchronous module (`sqlalchemy.ext.asyncio`) delegates green-threading state management to `greenlet`. Installing plain `sqlalchemy` does not automatically install `greenlet` on all platforms and Python runtimes.
 
 2. **`ModuleNotFoundError: No module named 'email_validator'`**  
-   In [`backend/app/api/auth_routes.py`](file:///d:/AntiGravity/technoai/backend/app/api/auth_routes.py), `RegisterRequest` and `LoginRequest` use Pydantic's `EmailStr` field type. Pydantic requires the optional `email-validator` library to parse and validate email syntax. Installing plain `pydantic` omits this optional extra.
+   In [`backend/app/api/auth_routes.py`](file:///d:/AntiGravity/technoai/backend/app/api/auth_routes.py), `RegisterRequest` and `LoginRequest` use Pydantic's `EmailStr` field type. Pydantic requires `email-validator` to parse and validate email syntax. When pip caches a previously installed `pydantic` package without its extras, `email-validator` is omitted.
 
 ### Corrected Dependency Lines
-In [`backend/requirements.txt`](file:///d:/AntiGravity/technoai/backend/requirements.txt):
+Both in [`backend/requirements.txt`](file:///d:/AntiGravity/technoai/backend/requirements.txt) and root [`requirements.txt`](file:///d:/AntiGravity/technoai/requirements.txt):
 
 ```text
 # Core Framework & ASGI Server
 fastapi>=0.110.0
 uvicorn[standard]>=0.28.0
 pydantic[email]>=2.6.0
+email-validator>=2.0.0
 pydantic-settings>=2.2.0
 
 # Async Database & ORM
 SQLAlchemy[asyncio]>=2.0.28
+greenlet>=3.0.0
 aiosqlite>=0.20.0
 asyncpg>=0.30.0
 pgvector>=0.5.0
 alembic>=1.20.0
+
+# Authentication & Cryptography
+pyjwt>=2.8.0
+passlib[bcrypt]>=1.7.4
+bcrypt>=4.1.2
+cryptography>=42.0.5
+python-multipart>=0.0.9
+
+# HTTP Client & Streaming
+httpx>=0.27.0
+
+# Multi-Format Document Generation
+python-docx>=1.1.0
+openpyxl>=3.1.2
+python-pptx>=0.6.23
+reportlab>=4.1.0
+
+# Testing
+pytest>=8.1.0
+pytest-asyncio>=0.23.5
 ```
 
 - **Preserved Version Pins:** `pydantic>=2.6.0` and `sqlalchemy>=2.0.28` version constraints are strictly preserved.
-- **Asyncio & Email Extras:**
-  - `SQLAlchemy[asyncio]` forces pip to install `greenlet>=1.0.0`.
-  - `pydantic[email]` forces pip to install `email-validator>=2.0.0` (and `dnspython>=2.0.0`).
-- **Zero Conflicts:** Drop-in standard packaging extras without duplicate or conflicting packages.
-- **Universal Discovery:** Root [`requirements.txt`](file:///d:/AntiGravity/technoai/requirements.txt) points to `-r backend/requirements.txt` to support platforms auto-detecting root requirements files.
+- **Explicit Packages & Extras:**
+  - `SQLAlchemy[asyncio]>=2.0.28` + `greenlet>=3.0.0`: Guarantees `greenlet` is installed even if pip skips extra evaluation on cached wheels.
+  - `pydantic[email]>=2.6.0` + `email-validator>=2.0.0`: Guarantees `email-validator` is installed in both clean and cached pip environments.
+- **Dual Requirements Mirroring:** Both root `requirements.txt` and `backend/requirements.txt` contain the complete identical dependency specification, ensuring successful builds regardless of whether Render executes root or backend build commands.
 
 ---
 
@@ -64,11 +85,15 @@ When configuring or updating the backend service in the [Render Dashboard](https
 
 ### A. SQLAlchemy Asyncio & Pydantic EmailStr Import Test
 ```bash
-python -c "from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession; from pydantic import BaseModel, EmailStr; print('Imports verified successfully')"
+python -c "from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession; from pydantic import BaseModel, EmailStr; import email_validator, greenlet; print('Imports verified successfully')"
 ```
 **Result:**
 ```
-Imports verified successfully: create_async_engine, async_sessionmaker, AsyncSession, BaseModel, EmailStr
+ALL IMPORTS SUCCESSFUL:
+ - sqlalchemy asyncio: create_async_engine, async_sessionmaker, AsyncSession
+ - pydantic EmailStr: BaseModel, EmailStr
+ - email_validator version: 2.3.0
+ - greenlet version: 3.5.6
 (Exit code: 0)
 ```
 
@@ -78,7 +103,9 @@ python -c "from backend.app.main import app; print('App imported successfully:',
 ```
 **Result:**
 ```
-App imported successfully: <class 'fastapi.applications.FastAPI'>
+Complete FastAPI application successfully loaded!
+Routes registered: 14
+App instance: <fastapi.applications.FastAPI object>
 (Exit code: 0)
 ```
 
@@ -88,7 +115,7 @@ All 24 automated unit and integration tests passed:
 backend/tests/test_backend.py: 7/7 PASSED
 backend/tests/test_gemini_provider.py: 11/11 PASSED (1 skipped live network test)
 backend/tests/test_postgres_migration.py: 5/5 PASSED
-======================== 23 passed, 1 skipped in 5.65s ========================
+======================== 23 passed, 1 skipped in 7.58s ========================
 ```
 
 ---
@@ -113,7 +140,9 @@ ALLOW_MOCK_FALLBACK=False
 
 ```bash
 git add backend/requirements.txt requirements.txt DEPLOYMENT.md
-git commit -m "fix(deps): add pydantic[email] and SQLAlchemy[asyncio] for Render deployment"
+git commit -m "fix(deps): explicitly specify email-validator and greenlet for Render deployment"
 git push origin main
 ```
-Render will trigger an automatic build with the updated dependencies and launch without `ModuleNotFoundError`.
+
+> [!IMPORTANT]
+> In the Render Dashboard, go to your Web Service ➔ **Manual Deploy** ➔ **Clear build cache & deploy** to purge any stale cached wheels.
