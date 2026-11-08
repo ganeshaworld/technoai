@@ -27,6 +27,7 @@ import IntegrationsView from '@/components/views/IntegrationsView';
 import AutomationsView from '@/components/views/AutomationsView';
 import SettingsView from '@/components/views/SettingsView';
 import OnboardingModal from '@/components/OnboardingModal';
+import { apiRequest } from '@/lib/api';
 
 export default function Home() {
   const [currentTab, setCurrentTab] = useState('dashboard');
@@ -39,14 +40,12 @@ export default function Home() {
     // Ensure an authenticated executive session token exists in localStorage
     const token = localStorage.getItem('technopie_token');
     if (!token) {
-      fetch('/api/auth/login', {
+      apiRequest<{ access_token?: string }>('/auth/login', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: 'demo@technopie.ai', password: 'DemoPassword123!' })
       })
-        .then((res) => res.json())
         .then((data) => {
-          if (data.access_token) {
+          if (data && data.access_token) {
             localStorage.setItem('technopie_token', data.access_token);
           }
         })
